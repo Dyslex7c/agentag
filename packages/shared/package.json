@@ -1,0 +1,9 @@
+{
+  "name": "@agentag/shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./abi/ServiceRegistry.json": "./abi/ServiceRegistry.json"
+  }
+}
