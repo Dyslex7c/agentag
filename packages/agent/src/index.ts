@@ -1,6 +1,5 @@
 import {
   createPublicClient,
-  createWalletClient,
   http,
   parseEther,
   formatEther,
@@ -9,6 +8,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { avalancheFuji } from "viem/chains";
+import { Facinet } from "facinet-sdk";
 import Groq from "groq-sdk";
 import "dotenv/config";
 import { readFileSync } from "node:fs";
@@ -43,10 +43,9 @@ const publicClient = createPublicClient({
   transport: http(),
 });
 
-const walletClient = createWalletClient({
-  account,
-  chain: avalancheFuji,
-  transport: http(),
+const facinet = new Facinet({
+  network: "avalanche-fuji",
+  privateKey: PRIVATE_KEY,
 });
 
 // ── Groq client ──────────────────────────────────────────────────────
@@ -59,7 +58,7 @@ const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "call_service",
       description:
-        "Call a paid microservice. Available services: 'summarize' (summarizes text in 2 sentences), 'sentiment' (returns sentiment score and label), 'translate' (translates text to Hindi). Each call may require an on-chain AVAX payment.",
+        "Call a paid microservice. Available services: 'summarize' (summarizes text in 2 sentences), 'sentiment' (returns sentiment score and label), 'translate' (translates text to any language — specify targetLanguage). Each call requires an on-chain AVAX payment.",
       parameters: {
         type: "object",
         properties: {
@@ -71,6 +70,11 @@ const tools: Groq.Chat.Completions.ChatCompletionTool[] = [
           text: {
             type: "string",
             description: "The text to process",
+          },
+          targetLanguage: {
+            type: "string",
+            description:
+              "Required when serviceName is 'translate'. The language to translate into, e.g. 'Hindi', 'French', 'Spanish', 'Bengali', 'Japanese'.",
           },
         },
         required: ["serviceName", "text"],
@@ -94,17 +98,25 @@ interface ServiceSuccessResponse {
 
 async function callService(
   serviceName: string,
-  text: string
+  text: string,
+  targetLanguage?: string
 ): Promise<string> {
   const url = `${SERVICES_URL}/${serviceName}`;
 
-  console.log(`\n📡 Calling service: ${serviceName}`);
+  console.log(`\n📡 Calling service: ${serviceName}${targetLanguage ? ` (→ ${targetLanguage})` : ""}`);
   console.log(`   URL: ${url}`);
 
+  const buildBody = (callerAddress: string): Record<string, string> => {
+    const b: Record<string, string> = { text, callerAddress };
+    if (targetLanguage) b.targetLanguage = targetLanguage;
+    return b;
+  };
+
+  // First attempt with agent's own address
   let response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, callerAddress: account.address }),
+    body: JSON.stringify(buildBody(account.address)),
   });
 
   if (response.status === 402) {
@@ -114,27 +126,40 @@ async function callService(
     console.log(`   Contract: ${paymentInfo.contract}`);
 
     const valueWei = parseEther(paymentInfo.priceAvax.toString());
-    console.log(`\n🔗 Sending payment via viem walletClient...`);
+    console.log(`\n🔗 Submitting via Facinet (gasless)...`);
 
-    const hash = await walletClient.writeContract({
-      address: CONTRACT_ADDRESS,
-      abi,
+    const txResult = await facinet.executeContract({
+      contractAddress: CONTRACT_ADDRESS,
       functionName: "payForService",
-      args: [serviceName],
-      value: valueWei,
+      functionArgs: [serviceName],
+      abi,
+      value: valueWei.toString(),
     });
 
-    console.log(`   ✅ Tx submitted: https://testnet.snowtrace.io/tx/${hash}`);
-    console.log(`   ⏳ Waiting for confirmation...`);
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    console.log(`   ⛽ Gas used: ${receipt.gasUsed}`);
-    console.log(`   ✅ Confirmed in block ${receipt.blockNumber}`);
+    console.log(
+      `   ✅ Tx submitted: https://testnet.snowtrace.io/tx/${txResult.txHash}`
+    );
+    console.log(
+      `   🏗️  Facilitator: ${txResult.facilitator.name} (${txResult.facilitator.id.slice(0, 8)}…)`
+    );
+    if (txResult.gasUsed) {
+      console.log(`   ⛽ Gas used: ${txResult.gasUsed} (paid by facilitator)`);
+    }
 
-    console.log(`\n🔄 Retrying service call: ${serviceName}`);
+    // The contract records lastPayment[msg.sender] = facilitator wallet.
+    // So we retry using the facilitator's wallet address as callerAddress —
+    // the service will call hasAccess(facilitatorWallet) which returns true.
+    const facilitatorWallet = txResult.facilitator.wallet as string;
+    console.log(`   🔑 Access recorded for facilitator: ${facilitatorWallet}`);
+
+    // Wait for chain state to propagate
+    await new Promise((r) => setTimeout(r, 3000));
+
+    console.log(`\n🔄 Retrying service call as facilitator wallet...`);
     response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, callerAddress: account.address }),
+      body: JSON.stringify(buildBody(facilitatorWallet)),
     });
   }
 
@@ -160,9 +185,13 @@ async function runAgent(userPrompt: string): Promise<void> {
       content: `You are an AI orchestrator. You have access to three paid microservices via the call_service tool:
 - "summarize": Summarizes text in 2 sentences
 - "sentiment": Returns a sentiment score (-1 to 1) and label (positive/negative/neutral)
-- "translate": Translates text to Hindi
+- "translate": Translates text to any language — you MUST pass the targetLanguage field (e.g. "French", "Hindi", "Bengali", "Japanese"). Infer the target language from the user's request.
 
-The user will give you a task and some text. Figure out which services are needed based on what they ask for, and call only those services in a logical order. If they ask to translate, use "translate". If they ask to summarize, use "summarize". If they ask for sentiment, use "sentiment". Don't call services the user didn't ask for. After receiving all results, compose a clear final response.`,
+Rules:
+- Only call services the user explicitly asks for.
+- For translate, always include targetLanguage inferred from the user's request.
+- Call services in a logical order (e.g. summarize first, then translate the summary).
+- After all results are in, compose a clear final response presenting each output.`,
     },
     {
       role: "user",
@@ -214,13 +243,16 @@ The user will give you a task and some text. Figure out which services are neede
       const args = JSON.parse(argsStr) as {
         serviceName: string;
         text: string;
+        targetLanguage?: string;
       };
 
-      console.log(`\n🔧 Tool call: ${name}(serviceName="${args.serviceName}")`);
+      console.log(
+        `\n🔧 Tool call: ${name}(serviceName="${args.serviceName}"${args.targetLanguage ? `, targetLanguage="${args.targetLanguage}"` : ""})`
+      );
 
       let result: string;
       try {
-        result = await callService(args.serviceName, args.text);
+        result = await callService(args.serviceName, args.text, args.targetLanguage);
       } catch (err) {
         result = `Error: ${err instanceof Error ? err.message : String(err)}`;
         console.error(`   ❌ ${result}`);
@@ -254,23 +286,24 @@ function prompt(question: string): Promise<string> {
 // ── Main REPL loop ────────────────────────────────────────────────────
 async function main(): Promise<void> {
   console.log("═".repeat(70));
-  console.log("🤖 AGENTAG — AI Agent with Smart Contract Payments");
+  console.log("🤖 AGENTAG — AI Agent with Gasless Payments (Facinet)");
   console.log("═".repeat(70));
   console.log(`\n📋 Wallet address: ${account.address}`);
 
   const balance = await publicClient.getBalance({ address: account.address });
   console.log(`💎 Balance: ${formatEther(balance)} AVAX`);
   console.log(`📝 Contract: ${CONTRACT_ADDRESS}`);
-  console.log(`🌐 Network: Avalanche Fuji`);
+  console.log(`🌐 Network: Avalanche Fuji (gas paid by Facinet facilitator)`);
 
   console.log(`\nAvailable services:`);
   console.log(`  • summarize  — summarize text into 2 sentences  (0.001 AVAX)`);
   console.log(`  • sentiment  — score sentiment -1 to 1          (0.0005 AVAX)`);
-  console.log(`  • translate  — translate text to Hindi          (0.0008 AVAX)`);
+  console.log(`  • translate  — translate to any language        (0.0008 AVAX)`);
   console.log(`\nExample prompts:`);
   console.log(`  > Summarize this: <your text>`);
-  console.log(`  > Translate and score the sentiment of this: <your text>`);
-  console.log(`  > Summarize, translate to Hindi, and score sentiment: <your text>`);
+  console.log(`  > Translate this to French: <your text>`);
+  console.log(`  > Translate this to Bengali and score the sentiment: <your text>`);
+  console.log(`  > Summarize, translate to Japanese, and score sentiment: <your text>`);
   console.log(`\nType "exit" to quit.\n`);
 
   while (true) {

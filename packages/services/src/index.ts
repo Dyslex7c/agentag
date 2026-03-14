@@ -53,7 +53,7 @@ const SERVICES: Record<string, ServiceDef> = {
   },
   translate: {
     name: "translate",
-    prompt: "Translate the following text to Hindi",
+    prompt: "", // built dynamically per request
     priceAvax: "0.0008",
   },
 };
@@ -94,7 +94,7 @@ const app = new Hono();
 
 app.get("/health", (c) => c.json({ status: "ok" }));
 
-// Route handler for a given service
+// Generic handler for summarize and sentiment (fixed prompts)
 async function handleServiceRequest(
   serviceName: string,
   c: { req: { json: <T>() => Promise<T> }; json: (data: unknown, status?: number) => Response }
@@ -131,9 +131,49 @@ async function handleServiceRequest(
   return c.json({ service: svc.name, result });
 }
 
+// Translate handler — dynamic prompt based on targetLanguage
+app.post("/translate", async (c) => {
+  const svc = SERVICES["translate"]!;
+  const body = await c.req.json<{
+    text: string;
+    callerAddress: string;
+    targetLanguage?: string;
+  }>();
+  const { text, callerAddress, targetLanguage } = body;
+
+  if (!text || !callerAddress) {
+    return c.json({ error: "Missing text or callerAddress" }, 400);
+  }
+
+  const language = targetLanguage?.trim() || "Hindi";
+
+  console.log(`[translate] Access check for ${callerAddress} (→ ${language})`);
+
+  const hasAccess = await checkAccess(callerAddress, svc.name);
+
+  if (!hasAccess) {
+    console.log(`[translate] Payment required for ${callerAddress}`);
+    return c.json(
+      {
+        error: "payment_required",
+        service: svc.name,
+        priceAvax: parseFloat(svc.priceAvax),
+        contract: CONTRACT_ADDRESS,
+      },
+      402
+    );
+  }
+
+  console.log(`[translate] Access granted — translating to ${language}...`);
+  const prompt = `Translate the following text to ${language}. Return only the translated text, no explanations.`;
+  const result = await callGroq(prompt, text);
+  console.log(`[translate] Done.`);
+
+  return c.json({ service: svc.name, result });
+});
+
 app.post("/summarize", (c) => handleServiceRequest("summarize", c));
 app.post("/sentiment", (c) => handleServiceRequest("sentiment", c));
-app.post("/translate", (c) => handleServiceRequest("translate", c));
 
 // ── Start server ─────────────────────────────────────────────────────
 serve({ fetch: app.fetch, port: PORT }, (info) => {
